@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math 
 
 def load_images_and_camera_metadata(data_dir):
     """
@@ -19,7 +20,12 @@ def positional_encoding(inputs, num_freqs):
     representation using sinusoidal encoding. this allows the network to model
     high-frequency variations such as texture and fine geometry.
     """
-    pass
+    encodings = []
+    for i in range(num_freqs):
+        freq = 2 ** i * math.pi
+        encodings.append(torch.sin(freq * inputs))
+        encodings.append(torch.cos(freq * inputs))
+    return torch.cat(encodings, dim=-1)
 
 # the actual model
 class NeRFModel(nn.Module):
@@ -55,7 +61,6 @@ class NeRFModel(nn.Module):
         # final dim is 3 (R, G, B)
         self.fc_color = nn.Linear(32, 3)
 
-        pass
 
     def forward(self, positions, view_directions):
         """
@@ -77,12 +82,12 @@ class NeRFModel(nn.Module):
         density = self.fc_density(a4)
 
         # MLP for RGB
-        feat = self.fc_feature(a4)
+        feat = self.fc_pos_features(a4)
         color = torch.cat([feat, dir_encoded], dim=-1)
 
         z_1 = self.fc_1(color)
         a_1 = torch.sin(z_1)
-        z_2 = self.fc_color_out(a_1)
+        z_2 = self.fc_color(a_1)
         rgb = torch.sigmoid(z_2) # clamp RGB values between [0,1]
 
         output = torch.cat([density, rgb], dim=-1)
@@ -96,6 +101,12 @@ def render_rays(model, ray_origins, ray_directions):
     query the NeRF model for density and color, and use volume rendering
     to compute the final pixel color seen along each ray.
     """
+    pass
+
+def compute_loss(prediction, target):
+    """
+        compute the error between the predicted color and the true color 
+        """
     pass
 
 # training Loop
@@ -129,7 +140,7 @@ def render_novel_views(model, camera_trajectory, output_dir):
         frame = render_rays(model, rays.origins, rays.directions)
         save_image(frame, output_dir)
 
-def main_pipeine(data_dir, output_dir):
+def main_pipeline(data_dir, output_dir):
     """
     Function: main_pipeline
     ----------------------------------------
@@ -138,6 +149,28 @@ def main_pipeine(data_dir, output_dir):
     - training the NeRF model.
     - rendering novel views from the trained model.
     """
+     = load_images_and_camera_metadata(data_dir)
+
+    pos_input_dim = 
+    dir_input_dim = 
+    num_frequencies =
+    model = NeRFModel(pos_input_dim = pos_input_dim,
+                      dir_input_dim = dir_input_dim,
+                      num_frequencies = num_frequencies)
+    
+    train_nerf(
+        model = model, 
+        training_rays = , 
+        training_colors = , 
+        epochs = , 
+        batch_size = , 
+        learning_rate = 0.01)
+    
+    render_novel_views(
+        model = model, 
+        camera_trajectory = , 
+        output_dir = output_dir)
+
     pass
 
 # entry point
