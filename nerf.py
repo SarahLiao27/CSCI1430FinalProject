@@ -1,6 +1,3 @@
-import torch
-import torch.nn as nn
-
 def load_images_and_camera_metadata(data_dir):
     """
     Function: load_images_and_camera_metadata
@@ -22,39 +19,17 @@ def positional_encoding(inputs, num_freqs):
     pass
 
 # the actual model
-class NeRFModel(nn.Module):
+class NeRFModel:
     """
     an MLP that represents the neural radiance field (NeRF).
     takes 3D spatial coordinates and viewing directions and returns density and RGB color.
     """
 
-    def __init__(self, pos_input_dim, dir_input_dim, num_frequencies):
+    def __init__(self):
         """
         initialize the NeRF model architecture including hidden layers,
         activation functions, and output heads for density and color.
         """
-        super(NeRFModel, self).__init__()
-
-        self.num_frequencies = num_frequencies;
-
-        # MLP for density
-        self.fc1 = nn.Linear(pos_input_dim, 256)
-        #arbitrary layers for now 
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 32)
-     
-        # final dim is 1 (d)
-        self.fc_density = nn.Linear(32, 1)
-
-        # positional features used for color prediction
-        self.fc_pos_features = nn.Linear(32, 16)
-
-        # MLP for RGB
-        self.fc_1 = nn.Linear(16 + dir_input_dim, 32)
-        # final dim is 3 (R, G, B)
-        self.fc_color = nn.Linear(32, 3)
-
         pass
 
     def forward(self, positions, view_directions):
@@ -62,31 +37,7 @@ class NeRFModel(nn.Module):
         compute density and color values from given 3D positions and view directions.
         positional encoding should be applied before passing to this function.
         """
-        pos_encoded = positional_encoding(positions, self.num_frequencies)
-        dir_encoded = positional_encoding(view_directions, self.num_frequencies)
-      
-        # MLP for density
-        z1 = self.fc1(pos_encoded)
-        a1 = torch.sin(z1) #use SIREN
-        z2 = self.fc2(a1)
-        a2 = torch.sin(z2)
-        z3 = self.fc3(a2)
-        a3 = torch.sin(z3)
-        z4 = self.fc4(a3)
-        a4 = torch.sin(z4)
-        density = self.fc_density(a4)
-
-        # MLP for RGB
-        feat = self.fc_feature(a4)
-        color = torch.cat([feat, dir_encoded], dim=-1)
-
-        z_1 = self.fc_1(color)
-        a_1 = torch.sin(z_1)
-        z_2 = self.fc_color_out(a_1)
-        rgb = torch.sigmoid(z_2) # clamp RGB values between [0,1]
-
-        output = torch.cat([density, rgb], dim=-1)
-        return output
+        pass
 
 def render_rays(model, ray_origins, ray_directions):
     """
