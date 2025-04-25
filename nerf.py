@@ -93,7 +93,7 @@ class NeRFModel(nn.Module):
         output = torch.cat([density, rgb], dim=-1)
         return output
 
-def render_rays(model, ray_origins, ray_directions):
+def render_rays(model, ray_origins, ray_directions, num_samples=75, near=2.0, far=10.0):
     """
     Function: render_rays
     ----------------------------------------
@@ -101,13 +101,43 @@ def render_rays(model, ray_origins, ray_directions):
     query the NeRF model for density and color, and use volume rendering
     to compute the final pixel color seen along each ray.
     """
-    pass
+    N_rays = ray_origins.shape[0]
+
+    # sample depth values along each ray
+    t_vals = torch.linspace(near, far, num_samples).to(ray_origins.device)     # [num_samples]
+    t_vals = t_vals.expand(N_rays, num_samples)                                # [N_rays, num_samples]
+
+    # send rays out in ray_direction 
+    sample_points = ray_origins[:, None, :] + ray_directions[:, None, :] * t_vals[..., None]  
+
+    # flatten points and directions for batching into model
+    flat_points = sample_points.reshape(-1, 3)  
+    flat_dirs = ray_directions[:, None, :].expand(-1, num_samples, -1).reshape(-1, 3)  
+
+    # Predict color and density at each sample point
+    outputs = model(flat_points, flat_dirs) 
+    density = outputs[:, 0].reshape(N_rays, num_samples) 
+    rgb = outputs[:, 1:].reshape(N_rays, num_samples, 3) 
+
+    # convert density to alpha
+    deltas = t_vals[:, 1:] - t_vals[:, :-1] 
+    delta_last = 1e10 * torch.ones_like(deltas[:, :1])  
+    deltas = torch.cat([deltas, delta_last], dim=-1)  
+    alpha = 1.0 - torch.exp(-density * deltas) 
+    transmittance = torch.cumprod(torch.cat([torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
+    weights = alpha * transmittance  
+
+    # Volume rendering
+    final_rgb = torch.sum(weights[..., None] * rgb, dim=1) 
+
+    return final_rgb # [N_rays, 3]
+
 
 def compute_loss(prediction, target):
     """
         compute the error between the predicted color and the true color 
         """
-    pass
+    return torch.mean((prediction - target) ** 2) # mean squared error
 
 # training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
