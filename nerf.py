@@ -42,17 +42,17 @@ class NeRFModel:
         super(NeRFModel, self).__init__()
 
         self.num_frequencies = num_frequencies
-        self.pos_dimensions = input_pos_dimensions
-        self.dir_dimensions = input_dir_dimensions
+        self.pos_dimensions = input_pos_dimensions * 2 * num_frequencies
+        self.dir_dimensions = input_dir_dimensions * 2 * num_frequencies
         hidden_size = 256
 
         self.pts_linears = nn.ModuleList([
-            nn.Linear(input_pos_dimensions, hidden_size),
+            nn.Linear(self.pos_dimensions, hidden_size),
             nn.Linear(hidden_size, hidden_size),       
             nn.Linear(hidden_size, hidden_size),    
             nn.Linear(hidden_size, hidden_size),   
             #skip connection layer, a bit confusing but tldr we need skip layers for vanishing gradiant problem         
-            nn.Linear(hidden_size + input_pos_dimensions, hidden_size),   
+            nn.Linear(hidden_size + self.pos_dimensions, hidden_size),   
             nn.Linear(hidden_size, hidden_size),                
             nn.Linear(hidden_size, hidden_size),          
             nn.Linear(hidden_size, hidden_size)      
@@ -60,7 +60,7 @@ class NeRFModel:
         self.relu = nn.ReLU()
         self.fc_sigma = nn.Linear(hidden_size, 1)
         self.fc_feature = nn.Linear(hidden_size, hidden_size)
-        self.view_linear = nn.Linear(hidden_size + input_dir_dimensions, 128)
+        self.view_linear = nn.Linear(hidden_size + self.dir_dimensions, 128)
         self.fc_rgb = nn.Linear(128, 3)
 
 
@@ -96,9 +96,9 @@ class NeRFModel:
 
         h = pos_encoded
         for i, layer in enumerate(self.pts_linears):
-            h = self.relu(layer(h))
             if i == 4: #for skip connection layer
                 h = torch.cat([h, pos_encoded], dim=-1)
+            h = self.relu(layer(h))
         sigma = self.fc_sigma(h)
         features = self.relu(self.fc_feature(h)) 
         h_dir = self.relu(self.view_linear(torch.cat([features, dir_encoded], dim=-1)))
