@@ -157,7 +157,7 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
     - comparing them with ground truth colors.
     - backpropagating and updating the model weights.
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(lr=learning_rate)
     rays_o, rays_d = training_rays
     dataset = torch.utils.data.TensorDataset(rays_o, rays_d, training_colors)
     loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
