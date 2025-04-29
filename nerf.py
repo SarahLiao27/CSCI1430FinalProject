@@ -34,32 +34,34 @@ class NeRFModel:
     takes 3D spatial coordinates and viewing directions and returns density and RGB color.
     """
 
-    def __init__(self):
+    def __init__(self, num_frequencies, input_pos_dimensions, input_dir_dimensions):
         """
         initialize the NeRF model architecture including hidden layers,
         activation functions, and output heads for density and color.
         """
         super(NeRFModel, self).__init__()
 
-        self.num_frequencies = num_frequencies;
+        self.num_frequencies = num_frequencies
+        self.pos_dimensions = input_pos_dimensions
+        self.dir_dimensions = input_dir_dimensions
+        hidden_size = 256
 
-        # MLP for density
-        self.fc1 = nn.Linear(pos_input_dim, 256)
-        #arbitrary layers for now 
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 32)
-     
-        # final dim is 1 (d)
-        self.fc_density = nn.Linear(32, 1)
-
-        # positional features used for color prediction
-        self.fc_pos_features = nn.Linear(32, 16)
-
-        # MLP for RGB
-        self.fc_1 = nn.Linear(16 + dir_input_dim, 32)
-        # final dim is 3 (R, G, B)
-        self.fc_color = nn.Linear(32, 3)
+        self.pts_linears = nn.ModuleList([
+            nn.Linear(input_pos_dimensions, hidden_size),
+            nn.Linear(hidden_size, hidden_size),       
+            nn.Linear(hidden_size, hidden_size),    
+            nn.Linear(hidden_size, hidden_size),   
+            #skip connection layer, a bit confusing but tldr we need skip layers for vanishing gradiant problem         
+            nn.Linear(hidden_size + input_pos_dimensions, hidden_size),   
+            nn.Linear(hidden_size, hidden_size),                
+            nn.Linear(hidden_size, hidden_size),          
+            nn.Linear(hidden_size, hidden_size)      
+        ])
+        self.relu = nn.ReLU()
+        self.fc_sigma = nn.Linear(hidden_size, 1)
+        self.fc_feature = nn.Linear(hidden_size, hidden_size)
+        self.view_linear = nn.Linear(hidden_size + input_dir_dimensions, 128)
+        self.fc_rgb = nn.Linear(128, 3)
 
 
     def forward(self, positions, view_directions):
@@ -70,27 +72,38 @@ class NeRFModel:
         pos_encoded = positional_encoding(positions, self.num_frequencies)
         dir_encoded = positional_encoding(view_directions, self.num_frequencies)
       
-        # MLP for density
-        z1 = self.fc1(pos_encoded)
-        a1 = torch.sin(z1) #use SIREN
-        z2 = self.fc2(a1)
-        a2 = torch.sin(z2)
-        z3 = self.fc3(a2)
-        a3 = torch.sin(z3)
-        z4 = self.fc4(a3)
-        a4 = torch.sin(z4)
-        density = self.fc_density(a4)
+        # # MLP for density
+        # z1 = self.fc1(pos_encoded)
+        # a1 = torch.sin(z1) #use SIREN
+        # z2 = self.fc2(a1)
+        # a2 = torch.sin(z2)
+        # z3 = self.fc3(a2)
+        # a3 = torch.sin(z3)
+        # z4 = self.fc4(a3)
+        # a4 = torch.sin(z4)
+        # density = self.fc_density(a4)
 
-        # MLP for RGB
-        feat = self.fc_pos_features(a4)
-        color = torch.cat([feat, dir_encoded], dim=-1)
+        # # MLP for RGB
+        # feat = self.fc_pos_features(a4)
+        # color = torch.cat([feat, dir_encoded], dim=-1)
 
-        z_1 = self.fc_1(color)
-        a_1 = torch.sin(z_1)
-        z_2 = self.fc_color(a_1)
-        rgb = torch.sigmoid(z_2) # clamp RGB values between [0,1]
+        # z_1 = self.fc_1(color)
+        # a_1 = torch.sin(z_1)
+        # z_2 = self.fc_color(a_1)
+        # rgb = torch.sigmoid(z_2) # clamp RGB values between [0,1]
 
-        output = torch.cat([density, rgb], dim=-1)
+        # output = torch.cat([density, rgb], dim=-1)
+
+        h = pos_encoded
+        for i, layer in enumerate(self.pts_linears):
+            h = self.relu(layer(h))
+            if i == 4: #for skip connection layer
+                h = torch.cat([h, pos_encoded], dim=-1)
+        sigma = self.fc_sigma(h)
+        features = self.relu(self.fc_feature(h)) 
+        h_dir = self.relu(self.view_linear(torch.cat([features, dir_encoded], dim=-1)))
+        rgb = torch.sigmoid(self.fc_rgb(h_dir))
+        output = torch.cat([sigma, rgb], dim=-1)  
         return output
 
 def render_rays(model, ray_origins, ray_directions, num_samples=75, near=2.0, far=10.0):
@@ -132,13 +145,6 @@ def render_rays(model, ray_origins, ray_directions, num_samples=75, near=2.0, fa
 
     return final_rgb # [N_rays, 3]
 
-
-def compute_loss(prediction, target):
-    """
-        compute the error between the predicted color and the true color 
-        """
-    return torch.mean((prediction - target) ** 2) # mean squared error
-
 # training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
     """
@@ -151,12 +157,19 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
     - comparing them with ground truth colors.
     - backpropagating and updating the model weights.
     """
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    rays_o, rays_d = training_rays
+    dataset = torch.utils.data.TensorDataset(rays_o, rays_d, training_colors)
+    loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     for epoch in range(epochs):
-        for batch in iterate_batches(training_rays, training_colors, batch_size):
-            rays_o, rays_d, colors = batch
-            predicted_colors = render_rays(model, rays_o, rays_d)
-            loss = compute_loss(predicted_colors, colors)
-            backpropagate_and_update(model, loss, learning_rate)
+        epoch_loss = 0.0
+        for rays_o_b, rays_d_b, colors_b in loader:
+            preds = render_rays(model, rays_o_b, rays_d_b)   # all on CPU
+            loss = nn.functional.mse_loss(preds, colors_b)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * rays_o_b.size(0)
 
 def render_novel_views(model, camera_trajectory, output_dir):
     """
