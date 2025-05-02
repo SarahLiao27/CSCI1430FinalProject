@@ -1,16 +1,43 @@
 import torch
 import torch.nn as nn
-import math 
+import math
+import os
+import json
+import imageio
+import numpy as np
 
-def load_images_and_camera_metadata(data_dir):
+def load_synthetic_images_and_camera_metadata(data_dir):
     """
     Function: load_images_and_camera_metadata
     ----------------------------------------
-    load all images and camera poses from the dataset directory.
-    these will be used to determine where each image was captured from,
-    which is crucial for accurate 3D scene reconstruction.
+    load all images and camera poses from the synthetic dataset.
+    
+    Returns:
+    - images: Tensor of shape [N, H, W, 3]
+    - poses: Tensor of shape [N, 4, 4]
+    - camera_angle_x: Float (field of view in x-direction)
     """
-    pass
+    json_path = os.path.join(data_dir, 'transforms_train.json')
+    with open(json_path, 'r') as f:
+        full_data = json.load(f)
+        metadata = full_data["root"]
+
+    images = []
+    poses = []
+
+    for frame in metadata['frames']:
+        image_path = os.path.join(data_dir, frame['file_path'] + '.png')
+        image = imageio.v2.imread(image_path).astype(np.float32) / 255.0  # normalize to [0, 1]
+        transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
+
+        images.append(image)
+        poses.append(transform_matrix)
+
+    images = torch.tensor(np.array(images), dtype=torch.float32)  # dims = [N, H, W, 3], N is the number of images
+    poses = torch.tensor(np.array(poses), dtype=torch.float32)    # dims = [N, 4, 4]
+    camera_angle_x = float(metadata['camera_angle_x'])
+
+    return images, poses, camera_angle_x
 
 def positional_encoding(inputs, num_freqs):
     """
@@ -192,23 +219,45 @@ def main_pipeline(data_dir, output_dir):
     - training the NeRF model.
     - rendering novel views from the trained model.
     """
-     = load_images_and_camera_metadata(data_dir)
+    # images has dim [N, H, W, 3]
+    # poses has dim [N, 4, 4]
+    # where N is the number of images
+    # assume color images
+    images, poses, camera_angle_x = load_synthetic_images_and_camera_metadata(data_dir)  
+    N, H, W, _ = images.shape
 
-    pos_input_dim = 
-    dir_input_dim = 
-    num_frequencies =
-    model = NeRFModel(pos_input_dim = pos_input_dim,
-                      dir_input_dim = dir_input_dim,
+    # generate rays and colors for all training images
+    all_rays_o = []
+    all_rays_d = []
+    all_rgb = []
+
+    for i in range(N):
+        rays_o, rays_d = generate_camera_rays(poses[i], H=H, W=W, camera_angle_x=camera_angle_x)
+        all_rays_o.append(rays_o)
+        all_rays_d.append(rays_d)
+        all_rgb.append(images[i].reshape(-1, 3))  # flatten image
+
+    # dims are [H * W, 3]
+    rays_o = torch.cat(all_rays_o, dim=0) 
+    rays_d = torch.cat(all_rays_d, dim=0)
+    colors = torch.cat(all_rgb, dim=0)
+
+    pos_input_dim = 3 # x,y,z
+    dir_input_dim = 3 # x,y,z
+    num_frequencies = 10 # standard i think
+
+    model = NeRFModel(input_pos_dimensions = pos_input_dim,
+                      input_dir_dimensions = dir_input_dim,
                       num_frequencies = num_frequencies)
     
     train_nerf(
         model = model, 
-        training_rays = , 
-        training_colors = , 
+        training_rays = (rays_o, rays_d),
+        training_colors = colors,
         epochs = , 
         batch_size = , 
-        learning_rate = 0.01)
-    
+        learning_rate= 0.01)
+
     render_novel_views(
         model = model, 
         camera_trajectory = , 
