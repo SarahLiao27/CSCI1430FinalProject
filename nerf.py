@@ -276,7 +276,9 @@ def main_pipeline(data_dir, output_dir):
     # poses has dim [N, 4, 4]
     # where N is the number of images
     # assume color images
-    images, poses, camera_angle_x = load_synthetic_images_and_camera_metadata(data_dir)  
+    if data_dir is None: # TODO: make the synthetic the default and add support for Google's dataset
+        data_dir = "data/nerf_synthetic"
+    images, poses, camera_angle_x = load_synthetic_images_and_camera_metadata(data_dir)
     N, H, W, _ = images.shape
 
     # generate rays and colors for all training images
