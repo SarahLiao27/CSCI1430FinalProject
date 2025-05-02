@@ -39,6 +39,59 @@ def load_synthetic_images_and_camera_metadata(data_dir):
 
     return images, poses, camera_angle_x
 
+def generate_camera_rays(camera_pose, H=800, W=800, camera_angle_x=0.6911112070083618):
+    """
+    generate ray origins and directions for all pixels in an image.
+
+    inputs:
+    - camera_pose: [4, 4] tensor, transformation matrix
+    - H, W: int, image height and width
+    - camera_angle_x: float, horizontal FOV (field of view) in radians
+
+    Returns:
+    - rays_o: [H*W, 3] tensor of ray origins (same for all pixels becuase the origin is the camera)
+    - rays_d: [H*W, 3] tensor of ray directions (world space)
+    """
+    # get the device (cpu/gpu) the camera pose is on so we compute everything in the same place
+    device = camera_pose.device 
+    
+    # calculate focal length
+    focal = 0.5 * W / torch.tan(camera_angle_x * 0.5)
+    
+    # make a grid of pixel coordinates (i for horizontal, j for vertical)
+    i, j = torch.meshgrid(
+        torch.arange(W, dtype=torch.float32, device=device),  # x-coordinates (horizontal pixels)
+        torch.arange(H, dtype=torch.float32, device=device),  # y-coordinates (vertical pixels)
+        indexing='xy'  # ensure proper alignment of pixel grids
+    )
+
+    # convert the pixel coordinates to camera space
+    # adjust for the center of the image and scale by focal length
+    # z is set to -1 because rays are projected from the camera into the scene
+    x = (i - W * 0.5) / focal
+    y = -(j - H * 0.5) / focal
+    z = -torch.ones_like(x)  # depth is -1 (we assume rays are cast in the negative z direction)
+
+    # stack x, y, z to create the direction vectors for each pixel
+    dirs = torch.stack([x, y, z], dim=-1)  # shape: [H, W, 3] for each pixel’s direction
+
+    # rotate the direction vectors using the camera's rotation matrix
+    # this transforms them from camera space to world space
+    ray_directions = torch.sum(dirs[..., None, :] * camera_pose[:3, :3], dim=-1)  # shape: [H, W, 3]
+    
+    # normalize the directions to unit vectors 
+    ray_directions = ray_directions / torch.norm(ray_directions, dim=-1, keepdim=True)
+
+    # the origin for all rays is the camera’s position, which is in the translation part of the camera pose
+    ray_origins = camera_pose[:3, 3].expand(ray_directions.shape)  
+    # shape dims = [H, W, 3]
+
+    # flatten the origins and directions to [H*W, 3] for easy processing later
+    rays_o = ray_origins.reshape(-1, 3)  # flatten origins
+    rays_d = ray_directions.reshape(-1, 3)  # flatten directions
+
+    return rays_o, rays_d
+
 def positional_encoding(inputs, num_freqs):
     """
     Function: positional_encoding
