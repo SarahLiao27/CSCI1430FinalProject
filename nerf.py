@@ -5,39 +5,82 @@ import os
 import json
 import imageio
 import numpy as np
+import random
 
-def load_synthetic_images_and_camera_metadata(data_dir):
+def load_synthetic_images_and_camera_metadata(data_dir, num_classes=8):
     """
     Function: load_images_and_camera_metadata
     ----------------------------------------
-    load all images and camera poses from the synthetic dataset.
-    
+    load images, poses, and camera angle information from the synthetic dataset,
+    and select a specific number of classes.
+
+    Parameters:
+    - data_dir: Root directory of the synthetic dataset (containing multiple subdirectories or "classes").
+    - num_classes: Number of classes to load from the dataset (default: 1).
+
     Returns:
     - images: Tensor of shape [N, H, W, 3]
     - poses: Tensor of shape [N, 4, 4]
-    - camera_angle_x: Float (field of view in x-direction)
+    - camera_angle_x_list: List of floats, one per class, representing the field of view in the x-direction.
     """
-    json_path = os.path.join(data_dir, 'transforms_train.json')
-    with open(json_path, 'r') as f:
-        full_data = json.load(f)
-        metadata = full_data["root"]
+
+    all_classes = sorted(os.listdir(data_dir))
+    selected_classes = random.sample(all_classes, min(num_classes, len(all_classes)))
 
     images = []
     poses = []
+    camera_angle_x_list = []
 
-    for frame in metadata['frames']:
-        image_path = os.path.join(data_dir, frame['file_path'] + '.png')
-        image = imageio.v2.imread(image_path).astype(np.float32) / 255.0  # normalize to [0, 1]
-        transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
+    for cls in selected_classes:
+        class_dir = os.path.join(data_dir, cls)
+        json_path = os.path.join(class_dir, 'transforms_train.json')
 
-        images.append(image)
-        poses.append(transform_matrix)
+        with open(json_path, 'r') as f:
+            full_data = json.load(f)
+            metadata = full_data["root"]
 
-    images = torch.tensor(np.array(images), dtype=torch.float32)  # dims = [N, H, W, 3], N is the number of images
-    poses = torch.tensor(np.array(poses), dtype=torch.float32)    # dims = [N, 4, 4]
-    camera_angle_x = float(metadata['camera_angle_x'])
+        class_images = []
+        class_poses = []
 
-    return images, poses, camera_angle_x
+        for frame in metadata['frames']:
+            image_path = os.path.join(class_dir, frame['file_path'] + '.png')
+            image = imageio.v2.imread(image_path).astype(np.float32) / 255.0  # normalize to [0, 1]
+            transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
+
+            class_images.append(image)
+            class_poses.append(transform_matrix)
+
+        images.extend(class_images)
+        poses.extend(class_poses)
+
+        # Add camera_angle_x for this class
+        camera_angle_x = float(metadata['camera_angle_x'])
+        camera_angle_x_list.append(camera_angle_x)
+
+    if not images:
+        raise RuntimeError("nothing loaded, check paths!")
+
+    images = torch.tensor(np.array(images), dtype=torch.float32)
+    poses = torch.tensor(np.array(poses), dtype=torch.float32)
+
+    return images, poses, camera_angle_x_list
+
+def load_google_objectron_images_and_camera_metadata():
+    """
+
+    get image frames and camera metadata from raw Objectron format.
+
+    inputs:
+    - seq_dir: path to a single Objectron sequence directory
+               (e.g., 'objectron/chair/abcd1234/')
+    - num_frames: maximum number of frames to extract and load
+
+    returns:
+    - images: Tensor [N, H, W, 3] (float32, normalized)
+    - poses: Tensor [N, 4, 4] (float32)
+    - camera_angle_x: float (field of view in x-direction, in radians)
+    """
+    pass
 
 def generate_camera_rays(camera_pose, H=800, W=800, camera_angle_x=0.6911112070083618):
     """
@@ -48,7 +91,7 @@ def generate_camera_rays(camera_pose, H=800, W=800, camera_angle_x=0.69111120700
     - H, W: int, image height and width
     - camera_angle_x: float, horizontal FOV (field of view) in radians
 
-    Returns:
+    returns:
     - rays_o: [H*W, 3] tensor of ray origins (same for all pixels becuase the origin is the camera)
     - rays_d: [H*W, 3] tensor of ray directions (world space)
     """
