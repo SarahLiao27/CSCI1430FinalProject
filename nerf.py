@@ -328,7 +328,7 @@ def render_rays(model, ray_origins, ray_directions,
     # Run volume rendering with fine samples
     rgb_fine, _ = volume_rendering(model, ray_directions, z_vals_combined, pts_fine)
 
-    return rgb_fine 
+    return rgb_fine # if there are errors with rgb_fine, try returning rgb_course instead for a less detailed render
 
 # training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
