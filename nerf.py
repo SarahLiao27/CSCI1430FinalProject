@@ -186,44 +186,106 @@ class NeRFModel:
         output = torch.cat([sigma, rgb], dim=-1)  
         return output
 
-def render_rays(model, ray_origins, ray_directions, num_samples=75, near=2.0, far=10.0):
+def sample_pdf(bins, weights, N_samples, det=False):
     """
-    Function: render_rays
-    ----------------------------------------
-    given a set of camera rays, sample 3D points along each ray,
-    query the NeRF model for density and color, and use volume rendering
-    to compute the final pixel color seen along each ray.
+    Hierarchical sampling using inverse transform sampling.
+    Args:
+        bins: [N_rays, N_samples-1] bin edges.
+        weights: [N_rays, N_samples-1] weight for each bin.
+        N_samples: number of samples to draw.
+        det: deterministic or random sampling.
+    Returns:
+        samples: [N_rays, N_samples] newly sampled depths.
+    """
+    weights += 1e-5  # Avoid nans
+    pdf = weights / torch.sum(weights, -1, keepdim=True)
+
+    # Gives a smooth function that goes from 0 -> 1 across the bins.
+    cdf = torch.cumsum(pdf, -1)
+    cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], -1)  # [N_rays, N_samples]
+    
+    if det:
+        u = torch.linspace(0.0, 1.0, N_samples).to(bins.device)
+        u = u.expand(cdf.shape[0], N_samples)
+    else:
+        u = torch.rand(cdf.shape[0], N_samples).to(bins.device)
+
+    # draw uniform samples u ~ Uniform(0, 1) and map them through the inverse CDF to get importance-based samples
+    inds = torch.searchsorted(cdf, u, right=True)
+    below = torch.clamp(inds - 1, min=0)
+    above = torch.clamp(inds, max=cdf.shape[-1] - 1)
+
+    inds_g = torch.stack([below, above], -1)  # [N_rays, N_samples, 2]
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(-1, N_samples, -1), 2, inds_g)
+    bins_g = torch.gather(bins.unsqueeze(1).expand(-1, N_samples, -1), 2, inds_g)
+
+    denom = cdf_g[..., 1] - cdf_g[..., 0]
+    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t = (u - cdf_g[..., 0]) / denom
+    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+    return samples
+
+def volume_rendering(model, ray_directions, z_vals, pts):
+    """
+    Perform volume rendering using sampled points and the NeRF model.
+    """
+    N_rays, N_samples = z_vals.shape
+
+    # Run NeRF model on sampled points and view directions
+    dirs = ray_directions[:, None, :].expand(-1, N_samples, -1).reshape(-1, 3)
+    pts_flat = pts.reshape(-1, 3)
+    outputs = model(pts_flat, dirs)
+    sigma = outputs[:, 0].reshape(N_rays, N_samples)     # density
+    rgb = outputs[:, 1:].reshape(N_rays, N_samples, 3)   # color
+
+    # Compute distances between adjacent z values
+    deltas = z_vals[:, 1:] - z_vals[:, :-1]
+    delta_inf = 1e10 * torch.ones_like(deltas[:, :1])  # large distance for last sample
+    deltas = torch.cat([deltas, delta_inf], dim=-1)
+
+    # Compute alpha and weights
+    alpha = 1.0 - torch.exp(-sigma * deltas)
+    trans = torch.cumprod(torch.cat([torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
+    weights = alpha * trans
+
+    # Final RGB using volume rendering equation
+    final_rgb = torch.sum(weights[..., None] * rgb, dim=1)
+
+    # composite with white background for like- empty space
+    final_rgb = final_rgb + (1.0 - weights.sum(-1, keepdim=True)) * torch.tensor([1.0, 1.0, 1.0], device=final_rgb.device)
+
+    return final_rgb, weights
+
+def render_rays(model, ray_origins, ray_directions, 
+                N_coarse=64, N_fine=128, near=2.0, far=10.0):
+    """
+    Render rays using NeRF with hierarchical sampling for improved efficiency and quality.
+    Returns a torch.Tensor of shape (N_rays, 3)
+    If we want to follow the paper more closely, could return both course and fine for loss computation 
     """
     N_rays = ray_origins.shape[0]
 
-    # sample depth values along each ray
-    t_vals = torch.linspace(near, far, num_samples).to(ray_origins.device)     # [num_samples]
-    t_vals = t_vals.expand(N_rays, num_samples)                                # [N_rays, num_samples]
+    # Coarse Sampling: sample evenly spaced depths between near and far
+    z_vals_coarse = torch.linspace(near, far, N_coarse).to(ray_origins.device)
+    z_vals_coarse = z_vals_coarse.expand(N_rays, N_coarse)
 
-    # send rays out in ray_direction 
-    sample_points = ray_origins[:, None, :] + ray_directions[:, None, :] * t_vals[..., None]  
+    pts_coarse = ray_origins[:, None, :] + ray_directions[:, None, :] * z_vals_coarse[..., None]
 
-    # flatten points and directions for batching into model
-    flat_points = sample_points.reshape(-1, 3)  
-    flat_dirs = ray_directions[:, None, :].expand(-1, num_samples, -1).reshape(-1, 3)  
+    # Run volume rendering with coarse samples
+    rgb_coarse, weights_coarse = volume_rendering(model, ray_directions, z_vals_coarse, pts_coarse)
 
-    # Predict color and density at each sample point
-    outputs = model(flat_points, flat_dirs) 
-    density = outputs[:, 0].reshape(N_rays, num_samples) 
-    rgb = outputs[:, 1:].reshape(N_rays, num_samples, 3) 
+    # Fine Sampling: sample more points around high-density regions
+    z_vals_mid = 0.5 * (z_vals_coarse[:, 1:] + z_vals_coarse[:, :-1])
+    z_vals_fine = sample_pdf(z_vals_mid, weights_coarse[:, 1:-1], N_fine)
 
-    # convert density to alpha
-    deltas = t_vals[:, 1:] - t_vals[:, :-1] 
-    delta_last = 1e10 * torch.ones_like(deltas[:, :1])  
-    deltas = torch.cat([deltas, delta_last], dim=-1)  
-    alpha = 1.0 - torch.exp(-density * deltas) 
-    transmittance = torch.cumprod(torch.cat([torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
-    weights = alpha * transmittance  
+    # Combine and sort all samples
+    z_vals_combined, _ = torch.sort(torch.cat([z_vals_coarse, z_vals_fine], dim=-1), dim=-1)
+    pts_fine = ray_origins[:, None, :] + ray_directions[:, None, :] * z_vals_combined[..., None]
 
-    # Volume rendering
-    final_rgb = torch.sum(weights[..., None] * rgb, dim=1) 
+    # Run volume rendering with fine samples
+    rgb_fine, _ = volume_rendering(model, ray_directions, z_vals_combined, pts_fine)
 
-    return final_rgb # [N_rays, 3]
+    return rgb_fine 
 
 # training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
