@@ -160,7 +160,7 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
     optimizer = torch.optim.Adam(lr=learning_rate)
     rays_o, rays_d = training_rays
     dataset = torch.utils.data.TensorDataset(rays_o, rays_d, training_colors)
-    loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     for epoch in range(epochs):
         epoch_loss = 0.0
         for rays_o_b, rays_d_b, colors_b in loader:
