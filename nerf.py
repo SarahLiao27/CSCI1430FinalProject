@@ -268,39 +268,8 @@ def sample_pdf(bins, weights, N_samples, det=False):
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
     return samples
 
-def volume_rendering(model, ray_directions, z_vals, pts):
-    """
-    Perform volume rendering using sampled points and the NeRF model.
-    """
-    N_rays, N_samples = z_vals.shape
-
-    # Run NeRF model on sampled points and view directions
-    dirs = ray_directions[:, None, :].expand(-1, N_samples, -1).reshape(-1, 3)
-    pts_flat = pts.reshape(-1, 3)
-    outputs = model(pts_flat, dirs)
-    sigma = outputs[:, 0].reshape(N_rays, N_samples)     # density
-    rgb = outputs[:, 1:].reshape(N_rays, N_samples, 3)   # color
-
-    # Compute distances between adjacent z values
-    deltas = z_vals[:, 1:] - z_vals[:, :-1]
-    delta_inf = 1e10 * torch.ones_like(deltas[:, :1])  # large distance for last sample
-    deltas = torch.cat([deltas, delta_inf], dim=-1)
-
-    # Compute alpha and weights
-    alpha = 1.0 - torch.exp(-sigma * deltas)
-    trans = torch.cumprod(torch.cat([torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
-    weights = alpha * trans
-
-    # Final RGB using volume rendering equation
-    final_rgb = torch.sum(weights[..., None] * rgb, dim=1)
-
-    # composite with white background for like- empty space
-    final_rgb = final_rgb + (1.0 - weights.sum(-1, keepdim=True)) * torch.tensor([1.0, 1.0, 1.0], device=final_rgb.device)
-
-    return final_rgb, weights
-
 def render_rays(model, ray_origins, ray_directions, 
-                N_coarse=64, N_fine=128, near=2.0, far=10.0):
+                N_coarse=64, N_fine=128, near=2.0, far=10.0, device = 'cpu'):
     """
     Render rays using NeRF with hierarchical sampling for improved efficiency and quality.
     Returns a torch.Tensor of shape (N_rays, 3)
@@ -308,27 +277,46 @@ def render_rays(model, ray_origins, ray_directions,
     """
     N_rays = ray_origins.shape[0]
 
-    # Coarse Sampling: sample evenly spaced depths between near and far
-    z_vals_coarse = torch.linspace(near, far, N_coarse).to(ray_origins.device)
-    z_vals_coarse = z_vals_coarse.expand(N_rays, N_coarse)
+    # Coarse sampling
+    z_vals_coarse = torch.linspace(near, far, N_coarse, device=device).expand(N_rays, N_coarse)
+    pts_coarse = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * z_vals_coarse.unsqueeze(-1)
+    pts_coarse_flat = pts_coarse.reshape(-1, 3)
+    dirs_coarse_flat = ray_directions.unsqueeze(1).expand(-1, N_coarse, -1).reshape(-1, 3)
 
-    pts_coarse = ray_origins[:, None, :] + ray_directions[:, None, :] * z_vals_coarse[..., None]
+    with torch.no_grad():  # Reduce memory during coarse pass
+        outputs_coarse = model(pts_coarse_flat, dirs_coarse_flat)
+    sigma_coarse = outputs_coarse[:, 0].reshape(N_rays, N_coarse)
+    rgb_coarse = outputs_coarse[:, 1:].reshape(N_rays, N_coarse, 3)
 
-    # Run volume rendering with coarse samples
-    rgb_coarse, weights_coarse = volume_rendering(model, ray_directions, z_vals_coarse, pts_coarse)
+    # Alpha compositing
+    deltas = z_vals_coarse[:, 1:] - z_vals_coarse[:, :-1]
+    delta_inf = torch.full((N_rays, 1), 1e10, device=device)
+    deltas = torch.cat([deltas, delta_inf], dim=1)
+    alpha = 1 - torch.exp(-sigma_coarse * deltas)
+    trans = torch.cumprod(1 - alpha + 1e-10, dim=1)[:, :-1]
+    weights_coarse = alpha * torch.cat([torch.ones_like(trans[:, :1]), trans], dim=1)
 
-    # Fine Sampling: sample more points around high-density regions
+    # Fine sampling
     z_vals_mid = 0.5 * (z_vals_coarse[:, 1:] + z_vals_coarse[:, :-1])
-    z_vals_fine = sample_pdf(z_vals_mid, weights_coarse[:, 1:-1], N_fine)
-
-    # Combine and sort all samples
+    z_vals_fine = sample_pdf(z_vals_mid, weights_coarse[:, 1:-1], N_fine, device=device)
     z_vals_combined, _ = torch.sort(torch.cat([z_vals_coarse, z_vals_fine], dim=-1), dim=-1)
-    pts_fine = ray_origins[:, None, :] + ray_directions[:, None, :] * z_vals_combined[..., None]
+    pts_fine = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * z_vals_combined.unsqueeze(-1)
+    pts_fine_flat = pts_fine.reshape(-1, 3)
+    dirs_fine_flat = ray_directions.unsqueeze(1).expand(-1, N_coarse + N_fine, -1).reshape(-1, 3)
 
-    # Run volume rendering with fine samples
-    rgb_fine, _ = volume_rendering(model, ray_directions, z_vals_combined, pts_fine)
+    outputs_fine = model(pts_fine_flat, dirs_fine_flat)
+    sigma_fine = outputs_fine[:, 0].reshape(N_rays, N_coarse + N_fine)
+    rgb_fine = outputs_fine[:, 1:].reshape(N_rays, N_coarse + N_fine, 3)
 
-    return rgb_fine # if there are errors with rgb_fine, try returning rgb_course instead for a less detailed render
+    # Final rendering
+    deltas_fine = z_vals_combined[:, 1:] - z_vals_combined[:, :-1]
+    deltas_fine = torch.cat([deltas_fine, delta_inf], dim=1)
+    alpha_fine = 1 - torch.exp(-sigma_fine * deltas_fine)
+    trans_fine = torch.cumprod(1 - alpha_fine + 1e-10, dim=1)[:, :-1]
+    weights_fine = alpha_fine * torch.cat([torch.ones_like(trans_fine[:, :1]), trans_fine], dim=1)
+    rgb = torch.sum(weights_fine.unsqueeze(-1) * rgb_fine, dim=1)
+
+    return rgb
 
 # training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
@@ -356,17 +344,31 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
             optimizer.step()
             epoch_loss += loss.item() * rays_o_b.size(0)
 
-def render_novel_views(model, camera_trajectory, output_dir):
+def render_novel_views(model, output_dir, num_frames=30, resolution=(400, 400)):
     """
     Function: render_novel_views
     ----------------------------------------
     render frames of the scene from new camera viewpoints specified by the trajectory.
     save each frame as an image file for visualizing novel perspectives of the learned 3D scene.
     """
-    for camera_pose in camera_trajectory:
-        rays = generate_camera_rays(camera_pose)
-        frame = render_rays(model, rays.origins, rays.directions)
-        save_image(frame, output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+
+    for i in range(num_frames):
+        theta = 2 * math.pi * i / num_frames
+        camera_pose = torch.tensor([
+            [np.cos(theta), -np.sin(theta), 0, 4 * np.cos(theta)],
+            [np.sin(theta),  np.cos(theta), 0, 4 * np.sin(theta)],
+            [0,             0,             1, 2],
+            [0,             0,             0, 1]
+        ], dtype=torch.float32)
+
+        rays_o, rays_d = generate_camera_rays(camera_pose, H=resolution[0], W=resolution[1])
+        with torch.no_grad():
+            rgb = render_rays(model, rays_o, rays_d, near=2.0, far=6.0, device='cpu')
+        
+        img = rgb.reshape(resolution[0], resolution[1], 3).numpy()
+        imageio.imwrite(os.path.join(output_dir, f"frame_{i:03d}.png"), (img * 255).astype(np.uint8))
 
 def main_pipeline(data_dir, output_dir):
     """
@@ -414,14 +416,11 @@ def main_pipeline(data_dir, output_dir):
         model = model, 
         training_rays = (rays_o, rays_d),
         training_colors = colors,
-        epochs = , 
-        batch_size = , 
-        learning_rate= 0.01)
+        epochs = 20, 
+        batch_size = 1024, 
+        learning_rate= 5e-4)
 
-    render_novel_views(
-        model = model, 
-        camera_trajectory = , 
-        output_dir = output_dir)
+    render_novel_views(model, "output_frames")
 
     pass
 
