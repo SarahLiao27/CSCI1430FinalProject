@@ -410,13 +410,14 @@ def main_pipeline(data_dir, output_dir):
                       input_dir_dimensions = dir_input_dim,
                       num_frequencies = num_frequencies)
     
+
     train_nerf(
         model = model, 
         training_rays = (rays_o, rays_d),
         training_colors = colors,
-        epochs = , 
-        batch_size = , 
-        learning_rate= 0.01)
+        epochs = 100, 
+        batch_size = 1024, 
+        learning_rate= 5 * 10**-4)
 
     render_novel_views(
         model = model, 
