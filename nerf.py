@@ -7,63 +7,65 @@ import imageio
 import numpy as np
 import random
 
-def load_synthetic_images_and_camera_metadata(data_dir, num_classes=8):
+def load_synthetic_images_and_camera_metadata(data_dir, split='train', num_classes=1):
     """
-    Function: load_images_and_camera_metadata
-    ----------------------------------------
-    load images, poses, and camera angle information from the synthetic dataset,
-    and select a specific number of classes.
+    Load images and camera data from NeRF synthetic dataset format.
 
-    Parameters:
-    - data_dir: Root directory of the synthetic dataset (containing multiple subdirectories or "classes").
-    - num_classes: Number of classes to load from the dataset (default: 1).
-
+    Args:
+        data_dir: Root directory containing class folders (e.g., 'data')
+        split: Which split to load ('train', 'test', or 'val')
+        num_classes: Number of class folders to use (default: 1)
     Returns:
-    - images: Tensor of shape [N, H, W, 3]
-    - poses: Tensor of shape [N, 4, 4]
-    - camera_angle_x_list: List of floats, one per class, representing the field of view in the x-direction.
+        images: Tensor of shape [N, H, W, 3]
+        poses: Tensor of shape [N, 4, 4]
+        camera_angle_x: Float (field of view in radians)
     """
-
-    all_classes = sorted(os.listdir(data_dir))
-    selected_classes = random.sample(all_classes, min(num_classes, len(all_classes)))
+    all_classes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    selected_classes = all_classes[:num_classes]  # Take first N classes
 
     images = []
     poses = []
-    camera_angle_x_list = []
+    camera_angle_x = None
 
     for cls in selected_classes:
         class_dir = os.path.join(data_dir, cls)
-        json_path = os.path.join(class_dir, 'transforms_train.json')
+        json_path = os.path.join(class_dir, f'transforms_{split}.json')
 
         with open(json_path, 'r') as f:
-            full_data = json.load(f)
-            metadata = full_data["root"]
+            metadata = json.load(f)
 
-        class_images = []
-        class_poses = []
+        # Store camera angle (same for all images in class)
+        if camera_angle_x is None:
+            camera_angle_x = metadata['camera_angle_x']
+        elif not math.isclose(camera_angle_x, metadata['camera_angle_x']):
+            print(f"Warning: Different camera_angle_x in {cls}")
 
         for frame in metadata['frames']:
-            image_path = os.path.join(class_dir, frame['file_path'] + '.png')
-            image = imageio.v2.imread(image_path).astype(np.float32) / 255.0  # normalize to [0, 1]
+            # Handle different path formats (some end with .png, some don't)
+            file_path = frame['file_path']
+            if not file_path.endswith('.png'):
+                file_path += '.png'
+            
+            # Handle both cases where images are in split folder or not
+            img_path = os.path.join(class_dir, file_path)
+            if not os.path.exists(img_path):
+                # Try looking in the split subdirectory
+                img_path = os.path.join(class_dir, split, os.path.basename(file_path))
+            
+            image = imageio.v2.imread(img_path).astype(np.float32) / 255.0
             transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
 
-            class_images.append(image)
-            class_poses.append(transform_matrix)
-
-        images.extend(class_images)
-        poses.extend(class_poses)
-
-        # Add camera_angle_x for this class
-        camera_angle_x = float(metadata['camera_angle_x'])
-        camera_angle_x_list.append(camera_angle_x)
+            images.append(image)
+            poses.append(transform_matrix)
 
     if not images:
-        raise RuntimeError("nothing loaded, check paths!")
+        raise RuntimeError(f"No images found in {data_dir} for split {split}")
 
-    images = torch.tensor(np.array(images), dtype=torch.float32)
-    poses = torch.tensor(np.array(poses), dtype=torch.float32)
-
-    return images, poses, camera_angle_x_list
+    return (
+        torch.tensor(np.array(images)),  # [N, H, W, 3]
+        torch.tensor(np.array(poses)),  # [N, 4, 4]
+        camera_angle_x
+    )
 
 def load_google_objectron_images_and_camera_metadata():
     """
@@ -98,6 +100,10 @@ def generate_camera_rays(camera_pose, H=800, W=800, camera_angle_x=0.69111120700
     # get the device (cpu/gpu) the camera pose is on so we compute everything in the same place
     device = camera_pose.device 
     
+    # Convert camera_angle_x to tensor if it's a float
+    if isinstance(camera_angle_x, float):
+        camera_angle_x = torch.tensor(camera_angle_x, device=device)
+
     # calculate focal length
     focal = 0.5 * W / torch.tan(camera_angle_x * 0.5)
     
@@ -151,7 +157,7 @@ def positional_encoding(inputs, num_freqs):
     return torch.cat(encodings, dim=-1)
 
 # the actual model
-class NeRFModel:
+class NeRFModel(nn.Module):
     """
     an MLP that represents the neural radiance field (NeRF).
     takes 3D spatial coordinates and viewing directions and returns density and RGB color.
@@ -229,7 +235,7 @@ class NeRFModel:
         output = torch.cat([sigma, rgb], dim=-1)  
         return output
 
-def sample_pdf(bins, weights, N_samples, det=False):
+def sample_pdf(bins, weights, N_samples, device, det=False):
     """
     Hierarchical sampling using inverse transform sampling.
     Args:
@@ -248,10 +254,10 @@ def sample_pdf(bins, weights, N_samples, det=False):
     cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], -1)  # [N_rays, N_samples]
     
     if det:
-        u = torch.linspace(0.0, 1.0, N_samples).to(bins.device)
+        u = torch.linspace(0.0, 1.0, N_samples, device=device)
         u = u.expand(cdf.shape[0], N_samples)
     else:
-        u = torch.rand(cdf.shape[0], N_samples).to(bins.device)
+        u = torch.rand(cdf.shape[0], N_samples, device=device)
 
     # draw uniform samples u ~ Uniform(0, 1) and map them through the inverse CDF to get importance-based samples
     inds = torch.searchsorted(cdf, u, right=True)
@@ -319,7 +325,7 @@ def render_rays(model, ray_origins, ray_directions,
     return rgb
 
 # training Loop
-def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate):
+def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate, device):
     """
     Function: train_nerf
     ----------------------------------------
@@ -330,14 +336,18 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
     - comparing them with ground truth colors.
     - backpropagating and updating the model weights.
     """
-    optimizer = torch.optim.Adam(lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     rays_o, rays_d = training_rays
     dataset = torch.utils.data.TensorDataset(rays_o, rays_d, training_colors)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     for epoch in range(epochs):
         epoch_loss = 0.0
         for rays_o_b, rays_d_b, colors_b in loader:
-            preds = render_rays(model, rays_o_b, rays_d_b)   # all on CPU
+            rays_o_b = rays_o_b.to(device)
+            rays_d_b = rays_d_b.to(device)
+            colors_b = colors_b.to(device)
+
+            preds = render_rays(model, rays_o_b, rays_d_b, device = device)   # all on CPU
             loss = nn.functional.mse_loss(preds, colors_b)
             optimizer.zero_grad()
             loss.backward()
@@ -383,21 +393,49 @@ def main_pipeline(data_dir, output_dir):
     # poses has dim [N, 4, 4]
     # where N is the number of images
     # assume color images
+    device_cpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_dir = "data/nerf_synthetic"
+
     if data_dir is None: # TODO: make the synthetic the default and add support for Google's dataset
         data_dir = "data/nerf_synthetic"
     images, poses, camera_angle_x = load_synthetic_images_and_camera_metadata(data_dir)
     N, H, W, _ = images.shape
 
-    # generate rays and colors for all training images
+    # Handle both cases where camera_angle_x is float or list
+    if isinstance(camera_angle_x, float):
+        # Single class case - use same angle for all images
+        camera_angle_x = [camera_angle_x] * N
+    elif isinstance(camera_angle_x, list):
+        # Multi-class case - ensure we have enough angles
+        if len(camera_angle_x) < N:
+            camera_angle_x = camera_angle_x * (N // len(camera_angle_x) + 1)
+            camera_angle_x = camera_angle_x[:N]
+
+    # Generate rays with proper camera angles
     all_rays_o = []
     all_rays_d = []
     all_rgb = []
 
     for i in range(N):
-        rays_o, rays_d = generate_camera_rays(poses[i], H=H, W=W, camera_angle_x=camera_angle_x)
+        angle_x = camera_angle_x[0] if isinstance(camera_angle_x, list) else camera_angle_x
+        rays_o, rays_d = generate_camera_rays(poses[i], H=H, W=W, camera_angle_x=angle_x)
+        
+        # Proper image reshaping:
+        img = images[i]
+        if img.shape[2] > 3:  # If RGBA (4 channels), remove alpha
+            img = img[..., :3]
+        elif img.shape[2] == 1:  # If grayscale, convert to RGB
+            img = img.expand(-1, -1, 3)
+            
+        # Calculate expected size
+        expected_size = H * W * 3
+        if img.numel() != expected_size:
+            print(f"Warning: Image {i} has unexpected size {img.shape}, resizing")
+            img = img.view(3, H, W).permute(1, 2, 0)  # Alternative reshape
+            
         all_rays_o.append(rays_o)
         all_rays_d.append(rays_d)
-        all_rgb.append(images[i].reshape(-1, 3))  # flatten image
+        all_rgb.append(img.reshape(H * W, 3))  
 
     # dims are [H * W, 3]
     rays_o = torch.cat(all_rays_o, dim=0) 
@@ -412,6 +450,8 @@ def main_pipeline(data_dir, output_dir):
                       input_dir_dimensions = dir_input_dim,
                       num_frequencies = num_frequencies)
     
+    model.to(device_cpu)
+
 
     train_nerf(
         model = model, 
@@ -419,7 +459,8 @@ def main_pipeline(data_dir, output_dir):
         training_colors = colors,
         epochs = 20, 
         batch_size = 1024, 
-        learning_rate= 5e-4)
+        learning_rate= 5e-4,
+        device = device_cpu)
 
     render_novel_views(model, "output_frames")
 
