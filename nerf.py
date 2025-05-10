@@ -380,6 +380,7 @@ def render_novel_views(model, output_dir, num_frames=30, resolution=(400, 400)):
         img = rgb.reshape(resolution[0], resolution[1], 3).numpy()
         imageio.imwrite(os.path.join(output_dir, f"frame_{i:03d}.png"), (img * 255).astype(np.uint8))
 
+
 def main_pipeline(data_dir, output_dir):
     """
     Function: main_pipeline

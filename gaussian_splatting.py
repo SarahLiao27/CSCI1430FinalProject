@@ -300,39 +300,77 @@ def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, l
     
     return model
 
-def render_novel_views(model, output_dir, H, W, focal, num_frames=30):
+def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
     """
-    Render novel views by moving the camera around the scene.
-    
-    Params:
+    Render novel views by creating a spiral path around poses[0].
+
+    Parameters:
     - model: Trained GaussianSplattingModel
-    - output_dir: A directory to put the views
+    - output_dir: Directory to save rendered images
     - H, W: Image height and width
     - focal: Focal length
-    - num_frames: Number of frames we want to render
+    - poses: [N, 4, 4] tensor of camera poses (torch.Tensor)
+    - num_frames: Number of novel views to render
     """
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
-    
-    with torch.no_grad():
+
+    base_pose = poses[0].to(model.device)  # Use the first pose as center
+
+    def create_spiral_poses_around(pose_center, radius=2.0, height=0.5, num_frames=30):
+        poses = []
         for i in range(num_frames):
-            # Create camera pose--rotates around the scene
-            theta = 2 * math.pi * i / num_frames
-            camera_pose = camera_pose_from_angle(theta)
-            rendered_image = model.render_image(camera_pose.to(model.device), H, W, focal)
+            angle = 2 * math.pi * i / num_frames
+            # Spiral offset in the local frame
+            offset = torch.tensor([
+                radius * math.cos(angle),
+                radius * math.sin(angle),
+                height * math.sin(angle * 0.5)
+            ], device=pose_center.device)
+
+            # Transform to world coordinates
+            world_pos = pose_center[:3, 3] + pose_center[:3, :3] @ offset
+
+            # Look-at target is the original camera position (center of the object)
+            look_at = pose_center[:3, 3]
+            forward = (look_at - world_pos)
+            forward = forward / torch.norm(forward)
+
+            # Up vector from base pose
+            up = pose_center[:3, 1]
+            right = torch.cross(up, forward)
+            right = right / torch.norm(right)
+            up = torch.cross(forward, right)
+
+            R = torch.stack([right, up, forward], dim=1)
+            T = world_pos
+
+            pose = torch.eye(4, device=pose_center.device)
+            pose[:3, :3] = R
+            pose[:3, 3] = T
+            poses.append(pose)
+        return poses
+
+    # Generate the spiral path
+    spiral_poses = create_spiral_poses_around(base_pose, radius=2.0, height=0.5, num_frames=num_frames)
+
+    with torch.no_grad():
+        for i, camera_pose in enumerate(spiral_poses):
+            rendered_image = model.render_image(camera_pose, H, W, focal)
             img_np = rendered_image.cpu().numpy()
             img_np = np.clip(img_np, 0, 1)
             img_uint8 = (img_np * 255).astype(np.uint8)
             imageio.imwrite(os.path.join(output_dir, f"frame_{i:03d}.png"), img_uint8)
-            # Display progress
+
+            # Optionally visualize every 5th frame
             if i % 5 == 0:
                 plt.figure(figsize=(8, 8))
                 plt.imshow(img_np)
                 plt.title(f"Frame {i}/{num_frames}")
                 plt.axis('off')
                 plt.show()
-    
-    print(f"Rendered {num_frames} frames to {output_dir}")
+
+    print(f"Rendered {num_frames} novel views to {output_dir}")
 
 def main_pipeline(data_dir="data/nerf_synthetic/chair", output_dir="gaussian_output"):
     """
@@ -347,7 +385,7 @@ def main_pipeline(data_dir="data/nerf_synthetic/chair", output_dir="gaussian_out
     focal = 0.5 * W / np.tan(0.5 * camera_angle_x)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Tested on laptop & oscar
     print(f"Using device: {device}")
-    num_gaussians = 20000 # Honestly our most limiting factor
+    num_gaussians = 1000 # Honestly our most limiting factor
     model = GaussianSplattingModel(num_gaussians=num_gaussians, device=device)
     epochs = 50 
     model = train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=epochs)
