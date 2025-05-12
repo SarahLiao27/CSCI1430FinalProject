@@ -10,30 +10,25 @@ import random
 def load_synthetic_images_and_camera_metadata(data_dir, split='train', num_classes=1):
     """
     Load images and camera data from NeRF synthetic dataset format.
-
-    Args:
-        data_dir: Root directory containing class folders (e.g., 'data')
-        split: Which split to load ('train', 'test', or 'val')
-        num_classes: Number of class folders to use (default: 1)
+    Params:
+    - class_dir: Directory for the dataset 
+    - split: Train, Test, or val
+    - num_classes: Number of class folders to use
     Returns:
-        images: Tensor of shape [N, H, W, 3]
-        poses: Tensor of shape [N, 4, 4]
-        camera_angle_x: Float (field of view in radians)
+    - images: Tensor of shape [N, H, W, 3]
+    - poses: Tensor of shape [N, 4, 4]
+    - camera_angle_x: Field of view in the x-direction
     """
     all_classes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
     selected_classes = all_classes[:num_classes]  # Take first N classes
-
     images = []
     poses = []
     camera_angle_x = None
-
     for cls in selected_classes:
         class_dir = os.path.join(data_dir, cls)
         json_path = os.path.join(class_dir, f'transforms_{split}.json')
-
         with open(json_path, 'r') as f:
             metadata = json.load(f)
-
         # Store camera angle (same for all images in class)
         if camera_angle_x is None:
             camera_angle_x = metadata['camera_angle_x']
@@ -45,110 +40,64 @@ def load_synthetic_images_and_camera_metadata(data_dir, split='train', num_class
             file_path = frame['file_path']
             if not file_path.endswith('.png'):
                 file_path += '.png'
-            
             # Handle both cases where images are in split folder or not
             img_path = os.path.join(class_dir, file_path)
             if not os.path.exists(img_path):
                 # Try looking in the split subdirectory
                 img_path = os.path.join(class_dir, split, os.path.basename(file_path))
-            
             image = imageio.v2.imread(img_path).astype(np.float32) / 255.0
             transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
-
             images.append(image)
             poses.append(transform_matrix)
-
     if not images:
         raise RuntimeError(f"No images found in {data_dir} for split {split}")
+    images = torch.tensor(np.array(images))
+    poses = torch.tensor(np.array(poses))
 
-    return (
-        torch.tensor(np.array(images)),  # [N, H, W, 3]
-        torch.tensor(np.array(poses)),  # [N, 4, 4]
-        camera_angle_x
-    )
-
-def load_google_objectron_images_and_camera_metadata():
-    """
-
-    get image frames and camera metadata from raw Objectron format.
-
-    inputs:
-    - seq_dir: path to a single Objectron sequence directory
-               (e.g., 'objectron/chair/abcd1234/')
-    - num_frames: maximum number of frames to extract and load
-
-    returns:
-    - images: Tensor [N, H, W, 3] (float32, normalized)
-    - poses: Tensor [N, 4, 4] (float32)
-    - camera_angle_x: float (field of view in x-direction, in radians)
-    """
-    pass
+    return (images, poses, camera_angle_x)
 
 def generate_camera_rays(camera_pose, H=800, W=800, camera_angle_x=0.6911112070083618):
     """
-    generate ray origins and directions for all pixels in an image.
-
-    inputs:
-    - camera_pose: [4, 4] tensor, transformation matrix
-    - H, W: int, image height and width
-    - camera_angle_x: float, horizontal FOV (field of view) in radians
-
-    returns:
+    Generates the ray origins and directions for all pixels in an image.
+    Params:
+    - camera_pose: [4, 4] tensor, the transformation matrix
+    - H, W: The image height and width
+    - camera_angle_x: Field of view in the x-direction
+    Returns:
     - rays_o: [H*W, 3] tensor of ray origins (same for all pixels becuase the origin is the camera)
     - rays_d: [H*W, 3] tensor of ray directions (world space)
     """
     # get the device (cpu/gpu) the camera pose is on so we compute everything in the same place
     device = camera_pose.device 
-    
-    # Convert camera_angle_x to tensor if it's a float
     if isinstance(camera_angle_x, float):
         camera_angle_x = torch.tensor(camera_angle_x, device=device)
-
-    # calculate focal length
     focal = 0.5 * W / torch.tan(camera_angle_x * 0.5)
-    
-    # make a grid of pixel coordinates (i for horizontal, j for vertical)
-    i, j = torch.meshgrid(
-        torch.arange(W, dtype=torch.float32, device=device),  # x-coordinates (horizontal pixels)
-        torch.arange(H, dtype=torch.float32, device=device),  # y-coordinates (vertical pixels)
-        indexing='xy'  # ensure proper alignment of pixel grids
-    )
-
-    # convert the pixel coordinates to camera space
-    # adjust for the center of the image and scale by focal length
-    # z is set to -1 because rays are projected from the camera into the scene
+    # Generate the pixel grid coordinates and convert them to camera space directions
+    i, j = torch.meshgrid(torch.arange(W, dtype=torch.float32, device=device), torch.arange(H, dtype=torch.float32, device=device), indexing='xy')
     x = (i - W * 0.5) / focal
     y = -(j - H * 0.5) / focal
-    z = -torch.ones_like(x)  # depth is -1 (we assume rays are cast in the negative z direction)
-
-    # stack x, y, z to create the direction vectors for each pixel
-    dirs = torch.stack([x, y, z], dim=-1)  # shape: [H, W, 3] for each pixel’s direction
-
-    # rotate the direction vectors using the camera's rotation matrix
-    # this transforms them from camera space to world space
-    ray_directions = torch.sum(dirs[..., None, :] * camera_pose[:3, :3], dim=-1)  # shape: [H, W, 3]
-    
-    # normalize the directions to unit vectors 
+    z = -torch.ones_like(x) 
+    dirs = torch.stack([x, y, z], dim=-1)
+    # Transform ray directions from camera space to world space then normalize
+    ray_directions = torch.sum(dirs[..., None, :] * camera_pose[:3, :3], dim=-1)
     ray_directions = ray_directions / torch.norm(ray_directions, dim=-1, keepdim=True)
-
-    # the origin for all rays is the camera’s position, which is in the translation part of the camera pose
+    # Get the ray origins from camera position and reshapes the outputs
     ray_origins = camera_pose[:3, 3].expand(ray_directions.shape)  
-    # shape dims = [H, W, 3]
-
-    # flatten the origins and directions to [H*W, 3] for easy processing later
-    rays_o = ray_origins.reshape(-1, 3)  # flatten origins
-    rays_d = ray_directions.reshape(-1, 3)  # flatten directions
+    rays_o = ray_origins.reshape(-1, 3)
+    rays_d = ray_directions.reshape(-1, 3)
 
     return rays_o, rays_d
 
 def positional_encoding(inputs, num_freqs):
     """
-    Function: positional_encoding
-    ----------------------------------------
-    convert raw input positions (e.g., x, y, z coordinates) to a higher-dimensional
-    representation using sinusoidal encoding. this allows the network to model
-    high-frequency variations such as texture and fine geometry.
+    Converts raw input positions to higher-dimensional representations using sinusoidal encoding.
+    Params:
+    - inputs: Tensor of input positions (e.g., x, y, z coordinates)
+    - num_freqs: Number of frequency bands to use for encoding
+    Returns:
+    - encoded: Higher-dimensional encoding that helps model high-frequency details
     """
+    # Generate the sinusoidal encodings for each frequency band
     encodings = []
     for i in range(num_freqs):
         freq = 2 ** i * math.pi
@@ -156,11 +105,10 @@ def positional_encoding(inputs, num_freqs):
         encodings.append(torch.cos(freq * inputs))
     return torch.cat(encodings, dim=-1)
 
-# the actual model
 class NeRFModel(nn.Module):
     """
-    an MLP that represents the neural radiance field (NeRF).
-    takes 3D spatial coordinates and viewing directions and returns density and RGB color.
+    An MLP that represents the neural radiance field (NeRF).
+    Takes 3D spatial coordinates and viewing directions and returns density and RGB color.
     """
 
     def __init__(self, num_frequencies, input_pos_dimensions, input_dir_dimensions):
@@ -192,37 +140,12 @@ class NeRFModel(nn.Module):
         self.view_linear = nn.Linear(hidden_size + self.dir_dimensions, 128)
         self.fc_rgb = nn.Linear(128, 3)
 
-
     def forward(self, positions, view_directions):
         """
-        compute density and color values from given 3D positions and view directions.
-        positional encoding should be applied before passing to this function.
+        Compute density and color values from given 3D positions and view directions.
         """
         pos_encoded = positional_encoding(positions, self.num_frequencies)
         dir_encoded = positional_encoding(view_directions, self.num_frequencies)
-      
-        # # MLP for density
-        # z1 = self.fc1(pos_encoded)
-        # a1 = torch.sin(z1) #use SIREN
-        # z2 = self.fc2(a1)
-        # a2 = torch.sin(z2)
-        # z3 = self.fc3(a2)
-        # a3 = torch.sin(z3)
-        # z4 = self.fc4(a3)
-        # a4 = torch.sin(z4)
-        # density = self.fc_density(a4)
-
-        # # MLP for RGB
-        # feat = self.fc_pos_features(a4)
-        # color = torch.cat([feat, dir_encoded], dim=-1)
-
-        # z_1 = self.fc_1(color)
-        # a_1 = torch.sin(z_1)
-        # z_2 = self.fc_color(a_1)
-        # rgb = torch.sigmoid(z_2) # clamp RGB values between [0,1]
-
-        # output = torch.cat([density, rgb], dim=-1)
-
         h = pos_encoded
         for i, layer in enumerate(self.pts_linears):
             if i == 4: #for skip connection layer
@@ -235,65 +158,64 @@ class NeRFModel(nn.Module):
         output = torch.cat([sigma, rgb], dim=-1)  
         return output
 
-def sample_pdf(bins, weights, N_samples, device, det=False):
+def sample_pdf(bins, weights, N_samples, device):
     """
     Hierarchical sampling using inverse transform sampling.
-    Args:
-        bins: [N_rays, N_samples-1] bin edges.
-        weights: [N_rays, N_samples-1] weight for each bin.
-        N_samples: number of samples to draw.
-        det: deterministic or random sampling.
+    Params:
+    - bins: [N_rays, N_samples-1], bin edges
+    - weights: [N_rays, N_samples-1], weight for each bin
+    - N_samples: The number of samples to draw
+    - device: The device we are using
     Returns:
-        samples: [N_rays, N_samples] newly sampled depths.
+    - samples: [N_rays, N_samples] newly sampled depths
     """
+    # Calculates the PDF and CDF from the weights
     weights += 1e-5  # Avoid nans
     pdf = weights / torch.sum(weights, -1, keepdim=True)
-
-    # Gives a smooth function that goes from 0 -> 1 across the bins.
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], -1)  # [N_rays, N_samples]
-    
-    if det:
-        u = torch.linspace(0.0, 1.0, N_samples, device=device)
-        u = u.expand(cdf.shape[0], N_samples)
-    else:
-        u = torch.rand(cdf.shape[0], N_samples, device=device)
-
-    # draw uniform samples u ~ Uniform(0, 1) and map them through the inverse CDF to get importance-based samples
+    cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], -1)
+    u = torch.rand(cdf.shape[0], N_samples, device=device)
+    # Find locations of samples through inverse CDF
     inds = torch.searchsorted(cdf, u, right=True)
     below = torch.clamp(inds - 1, min=0)
     above = torch.clamp(inds, max=cdf.shape[-1] - 1)
-
-    inds_g = torch.stack([below, above], -1)  # [N_rays, N_samples, 2]
+    # Gets the CDF and bin values for interpolation
+    inds_g = torch.stack([below, above], -1)
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(-1, N_samples, -1), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(-1, N_samples, -1), 2, inds_g)
-
+    # Do linear interpolation to get final samples
     denom = cdf_g[..., 1] - cdf_g[..., 0]
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
     t = (u - cdf_g[..., 0]) / denom
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+
     return samples
 
-def render_rays(model, ray_origins, ray_directions, 
-                N_coarse=64, N_fine=128, near=2.0, far=10.0, device = 'cpu'):
+def render_rays(model, ray_origins, ray_directions, N_coarse=64, N_fine=128, near=2.0, far=10.0, device = 'cpu'):
     """
-    Render rays using NeRF with hierarchical sampling for improved efficiency and quality.
-    Returns a torch.Tensor of shape (N_rays, 3)
-    If we want to follow the paper more closely, could return both course and fine for loss computation 
+    Render rays using NeRF with hierarchical sampling.
+    Params:
+    - model: Our NeRf model
+    - ray_origins: Tensor of ray origin positions
+    - ray_directions: Tensor of ray direction vectors
+    - N_coarse: Number of samples for coarse sampling
+    - N_fine: Number of samples for fine sampling
+    - near: Near bound for sampling
+    - far: Far bound for sampling
+    - device: Device being used
+    Returns:
+    - rgb: Tensor of rendered colors
     """
     N_rays = ray_origins.shape[0]
-
     # Coarse sampling
     z_vals_coarse = torch.linspace(near, far, N_coarse, device=device).expand(N_rays, N_coarse)
     pts_coarse = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * z_vals_coarse.unsqueeze(-1)
     pts_coarse_flat = pts_coarse.reshape(-1, 3)
     dirs_coarse_flat = ray_directions.unsqueeze(1).expand(-1, N_coarse, -1).reshape(-1, 3)
-
     with torch.no_grad():  # Reduce memory during coarse pass
         outputs_coarse = model(pts_coarse_flat, dirs_coarse_flat)
     sigma_coarse = outputs_coarse[:, 0].reshape(N_rays, N_coarse)
     rgb_coarse = outputs_coarse[:, 1:].reshape(N_rays, N_coarse, 3)
-
     # Alpha compositing
     deltas = z_vals_coarse[:, 1:] - z_vals_coarse[:, :-1]
     delta_inf = torch.full((N_rays, 1), 1e10, device=device)
@@ -301,7 +223,6 @@ def render_rays(model, ray_origins, ray_directions,
     alpha = 1 - torch.exp(-sigma_coarse * deltas)
     trans = torch.cumprod(1 - alpha + 1e-10, dim=1)[:, :-1]
     weights_coarse = alpha * torch.cat([torch.ones_like(trans[:, :1]), trans], dim=1)
-
     # Fine sampling
     z_vals_mid = 0.5 * (z_vals_coarse[:, 1:] + z_vals_coarse[:, :-1])
     z_vals_fine = sample_pdf(z_vals_mid, weights_coarse[:, 1:-1], N_fine, device=device)
@@ -309,11 +230,9 @@ def render_rays(model, ray_origins, ray_directions,
     pts_fine = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * z_vals_combined.unsqueeze(-1)
     pts_fine_flat = pts_fine.reshape(-1, 3)
     dirs_fine_flat = ray_directions.unsqueeze(1).expand(-1, N_coarse + N_fine, -1).reshape(-1, 3)
-
     outputs_fine = model(pts_fine_flat, dirs_fine_flat)
     sigma_fine = outputs_fine[:, 0].reshape(N_rays, N_coarse + N_fine)
     rgb_fine = outputs_fine[:, 1:].reshape(N_rays, N_coarse + N_fine, 3)
-
     # Final rendering
     deltas_fine = z_vals_combined[:, 1:] - z_vals_combined[:, :-1]
     deltas_fine = torch.cat([deltas_fine, delta_inf], dim=1)
@@ -324,17 +243,19 @@ def render_rays(model, ray_origins, ray_directions,
 
     return rgb
 
-# training Loop
 def train_nerf(model, training_rays, training_colors, epochs, batch_size, learning_rate, device):
     """
-    Function: train_nerf
-    ----------------------------------------
-    optimize the NeRF model.
-    each batch involves:
-    - selecting a subset of rays.
-    - rendering predicted RGB values.
-    - comparing them with ground truth colors.
-    - backpropagating and updating the model weights.
+    Trains the NeRF model.
+    Params:
+    - model: The NeRF model to train
+    - training_rays: ray_origins & ray_directions
+    - training_colors: Ground truth RGB colors for each ray
+    - epochs: Number of training epochs
+    - batch_size: Number of rays per batch
+    - learning_rate: Learning rate for the optimizer
+    - device: Device being used
+    Returns:
+    - model: Trained NeRF model
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     rays_o, rays_d = training_rays
@@ -346,8 +267,7 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
             rays_o_b = rays_o_b.to(device)
             rays_d_b = rays_d_b.to(device)
             colors_b = colors_b.to(device)
-
-            preds = render_rays(model, rays_o_b, rays_d_b, device = device)   # all on CPU
+            preds = render_rays(model, rays_o_b, rays_d_b, device = device) # all on CPU
             loss = nn.functional.mse_loss(preds, colors_b)
             optimizer.zero_grad()
             loss.backward()
@@ -356,14 +276,16 @@ def train_nerf(model, training_rays, training_colors, epochs, batch_size, learni
 
 def render_novel_views(model, output_dir, num_frames=30, resolution=(400, 400)):
     """
-    Function: render_novel_views
-    ----------------------------------------
-    render frames of the scene from new camera viewpoints specified by the trajectory.
-    save each frame as an image file for visualizing novel perspectives of the learned 3D scene.
+    Render frames of the scene from new camera viewpoints in a circular trajectory.
+    Params:
+    - model: Trained NeRF model
+    - output_dir: Directory to save rendered frames
+    - num_frames: Number of frames to render
+    - resolution: Resolution for output images
     """
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
-
+    # Renders the frames from different viewpoints along a circular path
     for i in range(num_frames):
         theta = 2 * math.pi * i / num_frames
         camera_pose = torch.tensor([
@@ -372,37 +294,27 @@ def render_novel_views(model, output_dir, num_frames=30, resolution=(400, 400)):
             [0,             0,             1, 2],
             [0,             0,             0, 1]
         ], dtype=torch.float32)
-
         rays_o, rays_d = generate_camera_rays(camera_pose, H=resolution[0], W=resolution[1])
         with torch.no_grad():
             rgb = render_rays(model, rays_o, rays_d, near=2.0, far=6.0, device='cpu')
-        
         img = rgb.reshape(resolution[0], resolution[1], 3).numpy()
         imageio.imwrite(os.path.join(output_dir, f"frame_{i:03d}.png"), (img * 255).astype(np.uint8))
 
 
 def main_pipeline(data_dir, output_dir):
     """
-    Function: main_pipeline
-    ----------------------------------------
-    full NeRF pipeline for static scenes. includes:
-    - loading input data.
-    - training the NeRF model.
-    - rendering novel views from the trained model.
+    NeRF pipeline.
+    Params:
+    - data_dir: Directory containing the input images and camera poses
+    - output_dir: Directory to save output renderings
     """
-    # images has dim [N, H, W, 3]
-    # poses has dim [N, 4, 4]
-    # where N is the number of images
-    # assume color images
     device_cpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_dir = "data/nerf_synthetic"
-
-    if data_dir is None: # TODO: make the synthetic the default and add support for Google's dataset
+    if data_dir is None:
         data_dir = "data/nerf_synthetic"
+    # Load and prepare image and camera data
     images, poses, camera_angle_x = load_synthetic_images_and_camera_metadata(data_dir)
     N, H, W, _ = images.shape
-
-    # Handle both cases where camera_angle_x is float or list
     if isinstance(camera_angle_x, float):
         # Single class case - use same angle for all images
         camera_angle_x = [camera_angle_x] * N
@@ -411,49 +323,38 @@ def main_pipeline(data_dir, output_dir):
         if len(camera_angle_x) < N:
             camera_angle_x = camera_angle_x * (N // len(camera_angle_x) + 1)
             camera_angle_x = camera_angle_x[:N]
-
-    # Generate rays with proper camera angles
+    # Generate rays and collect RGB values for all images
     all_rays_o = []
     all_rays_d = []
     all_rgb = []
-
     for i in range(N):
         angle_x = camera_angle_x[0] if isinstance(camera_angle_x, list) else camera_angle_x
         rays_o, rays_d = generate_camera_rays(poses[i], H=H, W=W, camera_angle_x=angle_x)
-        
-        # Proper image reshaping:
         img = images[i]
-        if img.shape[2] > 3:  # If RGBA (4 channels), remove alpha
+        if img.shape[2] > 3: # If RGBA, remove alpha channel
             img = img[..., :3]
-        elif img.shape[2] == 1:  # If grayscale, convert to RGB
+        elif img.shape[2] == 1: # If grayscale, convert to RGB
             img = img.expand(-1, -1, 3)
-            
-        # Calculate expected size
         expected_size = H * W * 3
         if img.numel() != expected_size:
             print(f"Warning: Image {i} has unexpected size {img.shape}, resizing")
-            img = img.view(3, H, W).permute(1, 2, 0)  # Alternative reshape
-            
+            img = img.view(3, H, W).permute(1, 2, 0)
         all_rays_o.append(rays_o)
         all_rays_d.append(rays_d)
         all_rgb.append(img.reshape(H * W, 3))  
-
-    # dims are [H * W, 3]
+    # Combine data from all images
     rays_o = torch.cat(all_rays_o, dim=0) 
     rays_d = torch.cat(all_rays_d, dim=0)
     colors = torch.cat(all_rgb, dim=0)
-
-    pos_input_dim = 3 # x,y,z
-    dir_input_dim = 3 # x,y,z
-    num_frequencies = 10 # standard i think
-
+    # Create the NeRF model
+    pos_input_dim = 3
+    dir_input_dim = 3
+    num_frequencies = 10
     model = NeRFModel(input_pos_dimensions = pos_input_dim,
                       input_dir_dimensions = dir_input_dim,
                       num_frequencies = num_frequencies)
-    
     model.to(device_cpu)
-
-
+    # Train the NeRF model
     train_nerf(
         model = model, 
         training_rays = (rays_o, rays_d),
@@ -462,11 +363,9 @@ def main_pipeline(data_dir, output_dir):
         batch_size = 1024, 
         learning_rate= 5e-4,
         device = device_cpu)
-
     render_novel_views(model, "output_frames")
 
-    pass
+    print("Pipeline completed successfully!")
 
-# entry point
 if __name__ == "__main__":
     main_pipeline("datadir", "outdir")

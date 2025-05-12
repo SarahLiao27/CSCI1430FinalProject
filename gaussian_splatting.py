@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
+import cv2
 import os
 import json
 import imageio
@@ -201,9 +201,9 @@ class GaussianSplattingModel(nn.Module):
             current_alpha = 1.0 - alpha_acc[min_y:max_y, min_x:max_x]
             alpha_acc[min_y:max_y, min_x:max_x] = alpha_acc[min_y:max_y, min_x:max_x] + gauss_val * current_alpha
             rendered_image[min_y:max_y, min_x:max_x] = (rendered_image[min_y:max_y, min_x:max_x] + color_contribution * current_alpha)
-        
         # For pixels that may be partially or not covered at all we cover it with the background
         rendered_image = rendered_image + bg_color.unsqueeze(0).unsqueeze(0) * (1.0 - alpha_acc)
+        
         return rendered_image
     
 def camera_pose_from_angle(theta, radius=4.0, height=2.0):
@@ -304,7 +304,7 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
     """
     Render novel views by creating a spiral path around poses[0].
 
-    Parameters:
+    Params:
     - model: Trained GaussianSplattingModel
     - output_dir: Directory to save rendered images
     - H, W: Image height and width
@@ -314,7 +314,6 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
     """
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
-
     base_pose = poses[0].to(model.device)  # Use the first pose as center
 
     def create_spiral_poses_around(pose_center, radius=2.0, height=0.5, num_frames=30):
@@ -327,33 +326,28 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
                 radius * math.sin(angle),
                 height * math.sin(angle * 0.5)
             ], device=pose_center.device)
-
             # Transform to world coordinates
             world_pos = pose_center[:3, 3] + pose_center[:3, :3] @ offset
-
             # Look-at target is the original camera position (center of the object)
             look_at = pose_center[:3, 3]
             forward = (look_at - world_pos)
             forward = forward / torch.norm(forward)
-
             # Up vector from base pose
             up = pose_center[:3, 1]
             right = torch.cross(up, forward)
             right = right / torch.norm(right)
             up = torch.cross(forward, right)
-
             R = torch.stack([right, up, forward], dim=1)
             T = world_pos
-
             pose = torch.eye(4, device=pose_center.device)
             pose[:3, :3] = R
             pose[:3, 3] = T
             poses.append(pose)
-        return poses
 
+        return poses
+    
     # Generate the spiral path
     spiral_poses = create_spiral_poses_around(base_pose, radius=2.0, height=0.5, num_frames=num_frames)
-
     with torch.no_grad():
         for i, camera_pose in enumerate(spiral_poses):
             rendered_image = model.render_image(camera_pose, H, W, focal)
@@ -361,7 +355,6 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
             img_np = np.clip(img_np, 0, 1)
             img_uint8 = (img_np * 255).astype(np.uint8)
             imageio.imwrite(os.path.join(output_dir, f"frame_{i:03d}.png"), img_uint8)
-
             # Optionally visualize every 5th frame
             if i % 5 == 0:
                 plt.figure(figsize=(8, 8))
@@ -371,6 +364,30 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
                 plt.show()
 
     print(f"Rendered {num_frames} novel views to {output_dir}")
+
+def create_training_video(train_dir="hotdog_final", video_name="hotdog_angles.mp4", fps=5):
+    """
+    Creates an MP4 video using sequence of images
+
+    Parameters:
+    -----------
+    train_dir: Input path to images
+    video_name: Output file name
+    fps: Frames per second
+    """
+    images = [img for img in sorted(os.listdir(train_dir)) if img.endswith(".png")]
+    first = cv2.imread(os.path.join(train_dir, images[0]))
+    H, W, _ = first.shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(video_name, fourcc, fps, (W, H))
+    if not video.isOpened():
+        raise RuntimeError(f"Couldn’t open video writer for {video_name}")
+    for img in images:
+        frame = cv2.imread(os.path.join(train_dir, img))
+        video.write(frame)
+    video.release()
+
+    print(f"Saved {video_name}")
 
 def main_pipeline(data_dir="data/nerf_synthetic/chair", output_dir="gaussian_output"):
     """
@@ -390,7 +407,8 @@ def main_pipeline(data_dir="data/nerf_synthetic/chair", output_dir="gaussian_out
     epochs = 50 
     model = train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=epochs)
     render_novel_views(model, output_dir, H, W, focal, num_frames=30)
-    
+    create_training_video()
+
     print("Pipeline completed successfully!")
 
 if __name__ == "__main__":
