@@ -205,25 +205,6 @@ class GaussianSplattingModel(nn.Module):
         rendered_image = rendered_image + bg_color.unsqueeze(0).unsqueeze(0) * (1.0 - alpha_acc)
         
         return rendered_image
-    
-def camera_pose_from_angle(theta, radius=4.0, height=2.0):
-    """Create a camera pose matrix from an angle around the y-axis."""
-    # Camera's world position
-    camera_position = np.array([radius * np.cos(theta), height, radius * np.sin(theta)])
-    # Aim the camera toward the origin
-    forward = -camera_position / np.linalg.norm(camera_position)
-    up = np.array([0, 1, 0]) # Initial "up" direction
-    # Camera's right vector 
-    right = np.cross(up, forward)
-    right = right / np.linalg.norm(right)
-    up = np.cross(forward, right)
-    rotation = np.stack([right, up, forward], axis=1)
-    # Construct 4x4 transformation matrix
-    pose = np.eye(4)
-    pose[:3, :3] = rotation
-    pose[:3, 3] = camera_position
-    
-    return torch.tensor(pose, dtype=torch.float32)
 
 def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, lr=0.01):
     """
