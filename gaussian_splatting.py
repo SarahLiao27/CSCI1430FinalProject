@@ -9,6 +9,13 @@ import imageio
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import math
+import pickle
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+import re
+import struct
 
 def load_synthetic_images_and_camera_metadata(class_dir, num_classes=8):
     """
@@ -206,7 +213,7 @@ class GaussianSplattingModel(nn.Module):
         
         return rendered_image
 
-def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, lr=0.01):
+def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, lr=0.01, prune_threshold=0):
     """
     Trains the Gaussian Splatting model.
     
@@ -217,6 +224,7 @@ def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, l
     - camera_angle_x: Field of view in x-direction
     - epochs: Number of training epochs
     - lr: Learning rate
+    - prune_threshold: Opacity value below which Gaussians will be pruned
     """
     N, H, W, _ = images.shape
     focal = 0.5 * W / np.tan(0.5 * camera_angle_x)
@@ -248,6 +256,17 @@ def train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=100, l
                 model.scales.data.clamp_(min=0.001, max=1.0)
                 model.rotations.data = F.normalize(model.rotations.data, dim=1) # Normalize quaternions
                 model.colors.data.clamp_(0, 1) # Clamp colors to [0, 1]
+
+                # pruning
+                if prune_threshold > 0 and (epoch + 1) % 10 == 0:
+                    # prune low-opacity Gaussians every 10 epochs
+                    low_opacity_mask = model.opacities.data.squeeze() < prune_threshold
+                    model.means.data[low_opacity_mask] = 0
+                    model.scales.data[low_opacity_mask] = 0
+                    model.rotations.data[low_opacity_mask] = 0
+                    model.colors.data[low_opacity_mask] = 0
+                    model.opacities.data[low_opacity_mask] = 0
+
             epoch_loss += loss.item()
         avg_loss = epoch_loss / N
         losses.append(avg_loss)
@@ -346,7 +365,98 @@ def render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30):
 
     print(f"Rendered {num_frames} novel views to {output_dir}")
 
-def create_training_video(train_dir="hotdog_final", video_name="hotdog_angles.mp4", fps=5):
+def export_gaussians_to_ply(model, filename="ply_output/output.ply"):
+    """
+    export the Gaussian parameters from the model into a .ply file.
+    can view the .ply in SuperSplat to visualize the result and get novel views
+    """
+    num_gaussians = model.num_gaussians
+    means = model.means.detach().cpu().numpy()
+    colors = model.colors.detach().cpu().numpy()
+    opacities = torch.sigmoid(model.opacities).detach().cpu().numpy()
+    scales = model.scales.detach().cpu().numpy()
+    rotations = model.rotations.detach().cpu().numpy()
+
+    with open(filename, "wb") as f:
+        header = f"""ply
+format binary_little_endian 1.0
+element vertex {num_gaussians}
+property float x
+property float y
+property float z
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+property float opacity
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+end_header
+"""
+        f.write(header.encode('utf-8'))
+
+        # write each Gaussian
+        for i in range(num_gaussians):
+            data = struct.pack(
+                '<fff'      # x, y, z
+                'fff'       # r, g, b (float format)
+                'f'         # opacity
+                'fff'       # scale_x, scale_y, scale_z
+                'ffff',     # quaternion (w, x, y, z)
+                *means[i],
+                *colors[i],
+                opacities[i][0],
+                *scales[i],
+                *rotations[i]
+            )
+            f.write(data)
+    
+    print(f"Wrote {num_gaussians} Gaussians to {filename}")
+
+def encrypt_model(model, password: str, filename: str):
+    os.makedirs("models", exist_ok=True)
+    model_bytes = pickle.dumps(model)
+    salt = os.urandom(16)
+    kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+    key = kdf.derive(password.encode())
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    encrypted = aesgcm.encrypt(nonce, model_bytes, None)
+    with open(os.path.join("models", filename), "wb") as f:
+        f.write(salt + nonce + encrypted)
+        print("saved encrypted model")
+
+def decrypt_model(password: str, filename: str):
+    filepath = os.path.join("models", filename)
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    salt = data[:16]
+    nonce = data[16:28]
+    ciphertext = data[28:]
+
+    # derive key from password
+    kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+    key = kdf.derive(password.encode())
+
+    # decrypt
+    aesgcm = AESGCM(key)
+    try:
+        decrypted = aesgcm.decrypt(nonce, ciphertext, None)
+        return pickle.loads(decrypted)
+    except InvalidTag:
+        raise ValueError("Decryption failed. Incorrect password or corrupted file.")
+
+def render_novel_views_public(encrypted_model, password, output_dir, H, W, focal, poses, num_frames=30):
+        model = decrypt_model(encrypted_model, password)
+        return render_novel_views(model, output_dir, H, W, focal, poses, num_frames)
+
+def create_training_video(train_dir, video_name="hotdog_angles.mp4", fps=5):
     """
     Creates an MP4 video using sequence of images
 
@@ -356,7 +466,9 @@ def create_training_video(train_dir="hotdog_final", video_name="hotdog_angles.mp
     video_name: Output file name
     fps: Frames per second
     """
-    images = [img for img in sorted(os.listdir(train_dir)) if img.endswith(".png")]
+    images = [img for img in sorted(os.listdir(train_dir),
+                key=lambda x: int(re.search(r'\d+', x).group())
+                ) if img.endswith(".png")]
     first = cv2.imread(os.path.join(train_dir, images[0]))
     H, W, _ = first.shape
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -383,12 +495,14 @@ def main_pipeline(data_dir="data/nerf_synthetic/chair", output_dir="gaussian_out
     focal = 0.5 * W / np.tan(0.5 * camera_angle_x)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Tested on laptop & oscar
     print(f"Using device: {device}")
-    num_gaussians = 1000 # Honestly our most limiting factor
+    num_gaussians = 50 # Honestly our most limiting factor
+    epochs = 2
     model = GaussianSplattingModel(num_gaussians=num_gaussians, device=device)
-    epochs = 50 
-    model = train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=epochs)
-    render_novel_views(model, output_dir, H, W, focal, num_frames=30)
-    create_training_video()
+    model = train_gaussian_splatting(model, images, poses, camera_angle_x, epochs=epochs, prune_threshold=0)
+    render_novel_views(model, output_dir, H, W, focal, poses, num_frames=30)
+    # create_training_video(train_dir="chair_epochs")
+    encrypt_model(model, password="password123", filename="chair.enc")
+    export_gaussians_to_ply(model, f"ply_output/chair{num_gaussians}g{epochs}e.ply")
 
     print("Pipeline completed successfully!")
 
